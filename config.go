@@ -8,7 +8,7 @@
 // the host name to match on ("example.com"), and the second argument is the key
 // you want to retrieve ("Port"). The keywords are case insensitive.
 //
-// 		port := ssh_config.Get("myhost", "Port")
+//	port := ssh_config.Get("myhost", "Port")
 //
 // You can also manipulate an SSH config file and then print it or write it back
 // to disk.
@@ -122,6 +122,10 @@ func Get(alias, key string) string {
 	return DefaultUserSettings.Get(alias, key)
 }
 
+func ForEach(fn func(*Host) bool) {
+	DefaultUserSettings.ForEach(fn)
+}
+
 // GetAll retrieves zero or more directives for key for the given alias. GetAll
 // returns nil if no value was found, or if IgnoreErrors is false and we could
 // not parse the configuration file. Use GetAllStrict to disambiguate the
@@ -181,6 +185,20 @@ func (u *UserSettings) Get(alias, key string) string {
 	return val
 }
 
+func (u *UserSettings) ForEach(fn func(*Host) bool) {
+	u.LoadConfigs()
+	for _, cfg := range []*Config{u.customConfig, u.userConfig, u.systemConfig} {
+		if cfg == nil {
+			continue
+		}
+		for _, host := range cfg.Hosts {
+			if !fn(host) {
+				return
+			}
+		}
+	}
+}
+
 // GetAll retrieves zero or more directives for key for the given alias. GetAll
 // returns nil if no value was found, or if IgnoreErrors is false and we could
 // not parse the configuration file. Use GetStrict to disambiguate the latter
@@ -200,7 +218,7 @@ func (u *UserSettings) GetAll(alias, key string) []string {
 // error will be non-nil if and only if a user's configuration file or the
 // system configuration file could not be parsed, and u.IgnoreErrors is false.
 func (u *UserSettings) GetStrict(alias, key string) (string, error) {
-	u.doLoadConfigs()
+	u.LoadConfigs()
 	//lint:ignore S1002 I prefer it this way
 	if u.onceErr != nil && u.IgnoreErrors == false {
 		return "", u.onceErr
@@ -232,7 +250,7 @@ func (u *UserSettings) GetStrict(alias, key string) (string, error) {
 // or the system configuration file could not be parsed, and u.IgnoreErrors is
 // false.
 func (u *UserSettings) GetAllStrict(alias, key string) ([]string, error) {
-	u.doLoadConfigs()
+	u.LoadConfigs()
 	//lint:ignore S1002 I prefer it this way
 	if u.onceErr != nil && u.IgnoreErrors == false {
 		return nil, u.onceErr
@@ -271,7 +289,7 @@ func (u *UserSettings) ConfigFinder(f func() string) {
 	u.customConfigFinder = f
 }
 
-func (u *UserSettings) doLoadConfigs() {
+func (u *UserSettings) LoadConfigs() {
 	u.loadConfigs.Do(func() {
 		var filename string
 		var err error
@@ -494,23 +512,27 @@ func special(b byte) bool {
 // The following pattern would match any host in the 192.168.0.[0-9] network range:
 //
 //	Host 192.168.0.?
-func NewPattern(s string) (*Pattern, error) {
-	if s == "" {
+func NewPattern(x string) (*Pattern, error) {
+	if x == "" {
 		return nil, errors.New("ssh_config: empty pattern")
 	}
-	negated := false
-	if s[0] == '!' {
-		negated = true
-		s = s[1:]
+	p := &Pattern{str: x}
+	simple := true
+	if p.str[0] == '!' {
+		p.not = true
+		p.str = p.str[1:]
+		simple = false
 	}
 	var buf bytes.Buffer
 	buf.WriteByte('^')
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < len(p.str); i++ {
 		// A byte loop is correct because all metacharacters are ASCII.
-		switch b := s[i]; b {
+		switch b := p.str[i]; b {
 		case '*':
+			simple = false
 			buf.WriteString(".*")
 		case '?':
+			simple = false
 			buf.WriteString(".?")
 		default:
 			// borrowing from QuoteMeta here.
@@ -525,7 +547,21 @@ func NewPattern(s string) (*Pattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Pattern{str: s, regex: r, not: negated}, nil
+	if !simple {
+		p.regex = r
+	}
+	return p, nil
+}
+
+func (p *Pattern) Simple() bool {
+	return p.regex == nil
+}
+
+func (p *Pattern) Matches(s string) bool {
+	if p.regex == nil {
+		return strings.EqualFold(p.str, s)
+	}
+	return p.regex.MatchString(s)
 }
 
 // Host describes a Host directive and the keywords that follow it.
@@ -551,7 +587,7 @@ type Host struct {
 func (h *Host) Matches(alias string) bool {
 	found := false
 	for i := range h.Patterns {
-		if h.Patterns[i].regex.MatchString(alias) {
+		if h.Patterns[i].Matches(alias) {
 			if h.Patterns[i].not {
 				// Negated match. "A pattern entry may be negated by prefixing
 				// it with an exclamation mark (`!'). If a negated entry is
